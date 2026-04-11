@@ -1,0 +1,19 @@
+{
+  "name": "lamport-stream",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/cli.ts",
+    "build": "tsc",
+    "benchmark": "tsx src/benchmark.ts"
+  },
+  "dependencies": {
+    "p-limit": "^6.2.0",
+    "undici": "^7.24.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
