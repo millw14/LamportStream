@@ -588,5 +588,13 @@ async function main() {
 }
 
 if (isDirectRun()) {
-  void main();
+  const keepAlive = setInterval(() => {}, 1000);
+  void main()
+    .catch((err) => {
+      console.error(err);
+      process.exitCode = 1;
+    })
+    .finally(() => {
+      clearInterval(keepAlive);
+    });
 }

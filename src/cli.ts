@@ -21,4 +21,12 @@ async function main() {
   }
 }
 
-main();
+const keepAlive = setInterval(() => {}, 1000);
+main()
+  .catch((err) => {
+    console.error(err);
+    process.exitCode = 1;
+  })
+  .finally(() => {
+    clearInterval(keepAlive);
+  });
