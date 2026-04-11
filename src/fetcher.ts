@@ -20,6 +20,8 @@ const BASE_CONFIG = {
   encoding: "json" as const,
 };
 
+const MAX_PAGES_PER_CHUNK = 32;
+
 function findIdx(tx: FullTransaction, address: string): number {
   const keys = tx.transaction.message.accountKeys;
   for (let i = 0; i < keys.length; i++) {
@@ -87,8 +89,10 @@ async function fetchChunk(
   const hasPagination = result.paginationToken !== null;
   const span = chunk.lt - chunk.gte;
   const canSplit = span > MIN_SLOT_SPAN && depth < 10;
+  const shouldSplit = canSplit && (isHot || result.data.length >= FULL_TX_LIMIT);
+  const shouldPaginate = hasPagination && result.data.length >= FULL_TX_LIMIT;
 
-  if ((isHot || hasPagination) && canSplit) {
+  if (shouldSplit) {
     const mid = chunk.gte + (span >> 1);
     const [left, right] = await Promise.all([
       globalLimiter(() => fetchRetry(address, { gte: chunk.gte, lt: mid }, depth + 1)),
@@ -98,9 +102,12 @@ async function fetchChunk(
   }
 
   let txns = result.data;
-  if (hasPagination) {
+  if (shouldPaginate) {
     let token: string | null = result.paginationToken;
-    while (token) {
+    const seenTokens = new Set<string>();
+    let pagesFetched = 0;
+    while (token && pagesFetched < MAX_PAGES_PER_CHUNK && !seenTokens.has(token)) {
+      seenTokens.add(token);
       const page: { data: FullTransaction[]; paginationToken: string | null } =
         await rpcCall<FullTransaction>(address, {
           ...BASE_CONFIG,
@@ -110,6 +117,7 @@ async function fetchChunk(
       if (!page?.data?.length) break;
       for (let i = 0; i < page.data.length; i++) txns.push(page.data[i]);
       token = page.paginationToken;
+      pagesFetched++;
     }
   }
 

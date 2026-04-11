@@ -31,6 +31,8 @@ export async function discover(address: string): Promise<ScoutResult> {
       hasMore: false,
       midScoutCount: 0,
       midScoutSlotRange: 0,
+      midScoutMinSlot: 0,
+      midScoutMaxSlot: 0,
     };
   }
 
@@ -42,6 +44,8 @@ export async function discover(address: string): Promise<ScoutResult> {
   const hasMore = scoutResult.paginationToken !== null;
   let midScoutCount = 0;
   let midScoutSlotRange = 0;
+  let midScoutMinSlot = 0;
+  let midScoutMaxSlot = 0;
 
   if (hasMore || scoutCount >= 200) {
     const midpoint = minSlot + Math.floor((maxSlot - minSlot) / 2);
@@ -62,9 +66,21 @@ export async function discover(address: string): Promise<ScoutResult> {
 
     if (midResult.data.length > 0) {
       midScoutCount = midResult.data.length;
+      midScoutMinSlot = midResult.data[0].slot;
+      midScoutMaxSlot = midResult.data[midResult.data.length - 1].slot;
       midScoutSlotRange = midResult.data[midResult.data.length - 1].slot - midResult.data[0].slot + 1;
     }
   }
 
-  return { minSlot, maxSlot, scoutCount, scoutSlotRange, hasMore, midScoutCount, midScoutSlotRange };
+  return {
+    minSlot,
+    maxSlot,
+    scoutCount,
+    scoutSlotRange,
+    hasMore,
+    midScoutCount,
+    midScoutSlotRange,
+    midScoutMinSlot,
+    midScoutMaxSlot,
+  };
 }

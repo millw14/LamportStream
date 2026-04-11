@@ -1,0 +1,17 @@
+---
+description: Keep LamportStream work aligned to competition priorities
+alwaysApply: true
+---
+
+# LamportStream Final Focus
+
+- Optimize for Mert's order of importance: correctness, low RPC count, low worst-case latency, simple submission shape, easy reproducibility.
+- Treat `lamport-stream.ts` as the canonical artifact. Any performance-critical change should land there first or stay consistent with it.
+- Prefer fixes backed by real benchmark evidence on sparse, periodic, and dense wallets. Do not claim wins without running the canonical benchmark.
+- Do not drift into generic refactors, docs polish, or modular cleanup unless they directly improve correctness, benchmark validity, or the submission story.
+- When debugging dense wallets, assume Helius pagination tokens inside bounded slot ranges do not automatically imply a hot chunk.
+- Favor strategies that reduce full-transaction RPC volume or prevent recursive chunk explosions before adding more concurrency.
+- Keep output semantics stable: finalized transactions, `(slot, transactionIndex)` ordering, signature deduplication, and correct SOL balance extraction via `postBalances`.
+- If local testing reveals a benchmark or runner bug, fix the testing path only when it helps evaluate the canonical artifact reliably.
+- Before concluding work is done, verify with typecheck plus a benchmark pass that includes a dense wallet.
+- If a change improves sparse and periodic cases but dense still stalls, continue iterating on dense-tail behavior instead of stopping early.

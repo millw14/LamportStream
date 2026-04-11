@@ -38,6 +38,7 @@ const MAX_INFLIGHT = 64;
 const MIN_SPAN = 4;
 const TIMEOUT = 5000;
 const MAX_RETRY = 2;
+const MAX_PAGES_PER_CHUNK = 32;
 const SCOUT_LIM = 1000;
 const FULL_LIM = 100;
 
@@ -188,12 +189,24 @@ async function discover(
   ]);
 
   if (!newest.data.length || !scout.data.length) {
-    return { min: 0, max: 0, cnt: 0, range: 0, more: false, midCnt: 0, midRange: 0 };
+    return {
+      min: 0,
+      max: 0,
+      cnt: 0,
+      range: 0,
+      more: false,
+      midCnt: 0,
+      midRange: 0,
+      midMin: 0,
+      midMax: 0,
+    };
   }
 
   const cnt = scout.data.length;
   let midCnt = 0;
   let midRange = 0;
+  let midMin = 0;
+  let midMax = 0;
 
   const min = scout.data[0].slot;
   const max = newest.data[0].slot;
@@ -218,6 +231,8 @@ async function discover(
     });
     if (mid.data.length > 0) {
       midCnt = mid.data.length;
+      midMin = mid.data[0].slot;
+      midMax = mid.data[mid.data.length - 1].slot;
       midRange = mid.data[mid.data.length - 1].slot - mid.data[0].slot + 1;
     }
   }
@@ -230,19 +245,34 @@ async function discover(
     more,
     midCnt,
     midRange,
+    midMin,
+    midMax,
   };
 }
 
 function plan(s: Awaited<ReturnType<typeof discover>>, options?: LamportStreamOptions) {
+  const total = s.max - s.min;
+  const totalSlotRange = Math.max(1, total + 1);
+  const oldestDensity = s.range > 0 ? s.cnt / s.range : 0.000001;
+  const midDensity = s.midCnt && s.midRange ? s.midCnt / s.midRange : 0;
+  const density = Math.max(oldestDensity, midDensity || 0);
+  const sampledTx = s.cnt + s.midCnt;
+  const sampledRange = s.range + s.midRange;
+  const blendedDensity = sampledRange > 0 ? sampledTx / sampledRange : density;
+  const estimatedTotalTx = Math.max(blendedDensity, 0.000001) * totalSlotRange;
   let conc: number;
   let lo: number;
   let hi: number;
 
-  if (s.cnt < 50 && !s.more) {
+  if (!s.more && s.cnt < 50) {
     conc = 8;
     lo = 4;
     hi = 8;
-  } else if (s.cnt <= 500 && !s.more) {
+  } else if (estimatedTotalTx <= 250 && s.cnt < 100) {
+    conc = 8;
+    lo = 4;
+    hi = 8;
+  } else if (estimatedTotalTx <= 3000 && density < 0.01) {
     conc = 24;
     lo = 16;
     hi = 32;
@@ -252,20 +282,53 @@ function plan(s: Awaited<ReturnType<typeof discover>>, options?: LamportStreamOp
     hi = 64;
   }
 
-  const total = s.max - s.min;
   if (total <= 0) return { chunks: [{ gte: s.min, lt: s.max + 1 }] as Chunk[], conc };
 
-  const oldestDensity = s.range > 0 ? s.cnt / s.range : 0.0001;
-  const midDensity = s.midCnt && s.midRange ? s.midCnt / s.midRange : 0;
-  const density = Math.max(oldestDensity, midDensity || 0);
   let chunkCount = Math.ceil(total / Math.max(1, Math.floor(TARGET_TX / Math.max(density, 1e-6))));
   chunkCount = Math.max(lo, Math.min(hi, chunkCount));
   chunkCount = Math.max(MIN_C, Math.min(MAX_C, chunkCount));
 
-  const step = Math.ceil(total / chunkCount);
   const chunks: Chunk[] = [];
   const scoutEnd = s.min + s.range;
-  const outerDensity = s.more ? density * 1.25 : density * 0.5;
+  const midStart = s.midMin;
+  const midEnd = s.midMax > 0 ? s.midMax + 1 : 0;
+  const hasMidWindow = s.midCnt > 0 && midEnd > midStart;
+  const outerDensity = Math.max(oldestDensity * (s.more ? 0.15 : 0.5), 0.000001);
+
+  const appendRangeChunks = (start: number, end: number, chunkBudget: number, localDensity: number) => {
+    if (end <= start || chunkBudget <= 0) return;
+    const step = Math.max(1, Math.ceil((end - start) / chunkBudget));
+    for (let cursor = start; cursor < end; cursor += step) {
+      const gte = cursor;
+      const lt = Math.min(end, cursor + step);
+      const span = lt - gte;
+      if (localDensity * span > 90 && span > 1) {
+        const mid = gte + (span >> 1);
+        chunks.push({ gte, lt: mid }, { gte: mid, lt });
+      } else {
+        chunks.push({ gte, lt });
+      }
+    }
+  };
+
+  if (estimatedTotalTx > 10000 && hasMidWindow && s.range > 0 && totalSlotRange > s.range * 2) {
+    const oldestBudget = Math.max(12, Math.round(hi * 0.2));
+    const midBudget = Math.max(18, Math.round(hi * 0.35));
+    const outsideBudget = Math.max(8, hi - oldestBudget - midBudget);
+    const beforeMidRange = Math.max(0, midStart - scoutEnd);
+    const afterMidRange = Math.max(0, s.max + 1 - midEnd);
+    const outsideRange = beforeMidRange + afterMidRange;
+    const beforeMidBudget = outsideRange > 0 ? Math.round(outsideBudget * (beforeMidRange / outsideRange)) : 0;
+    const afterMidBudget = outsideBudget - beforeMidBudget;
+
+    appendRangeChunks(s.min, scoutEnd, oldestBudget, oldestDensity);
+    appendRangeChunks(scoutEnd, midStart, beforeMidBudget, outerDensity);
+    appendRangeChunks(midStart, midEnd, midBudget, midDensity);
+    appendRangeChunks(midEnd, s.max + 1, afterMidBudget, outerDensity);
+    return { chunks, conc: options?.rootConcurrencyOverride ?? conc };
+  }
+
+  const step = Math.ceil(total / chunkCount);
 
   for (let i = 0; i < chunkCount; i++) {
     const gte = s.min + i * step;
@@ -273,7 +336,13 @@ function plan(s: Awaited<ReturnType<typeof discover>>, options?: LamportStreamOp
     if (gte >= s.max + 1) break;
 
     const span = lt - gte;
-    const localDensity = gte < scoutEnd ? density : outerDensity;
+    const isInOldestRange = gte < scoutEnd;
+    const isInMidRange = hasMidWindow && gte >= midStart && gte < midEnd;
+    const localDensity = isInMidRange
+      ? midDensity
+      : isInOldestRange
+        ? oldestDensity
+        : outerDensity;
     if (localDensity * span > 90 && span > 1) {
       const mid = gte + (span >> 1);
       chunks.push({ gte, lt: mid }, { gte: mid, lt });
@@ -463,8 +532,10 @@ async function fetchChunk(
   const hot = result.data.length >= HOT;
   const paginated = result.paginationToken !== null;
   const span = chunk.lt - chunk.gte;
+  const shouldSplit = span > MIN_SPAN && depth < 10 && (hot || result.data.length >= FULL_LIM);
+  const shouldPaginate = paginated && result.data.length >= FULL_LIM;
 
-  if ((hot || paginated) && span > MIN_SPAN && depth < 10) {
+  if (shouldSplit) {
     const mid = chunk.gte + (span >> 1);
     const [left, right] = await Promise.all([
       globalLimiter(() => fetchRetry(apiKey, addr, { gte: chunk.gte, lt: mid }, depth + 1, statusFilter, globalLimiter)),
@@ -474,9 +545,12 @@ async function fetchChunk(
   }
 
   let txns = result.data;
-  if (paginated) {
+  if (shouldPaginate) {
     let token: string | null = result.paginationToken;
-    while (token) {
+    const seenTokens = new Set<string>();
+    let pagesFetched = 0;
+    while (token && pagesFetched < MAX_PAGES_PER_CHUNK && !seenTokens.has(token)) {
+      seenTokens.add(token);
       const page = await rpc<any>(apiKey, addr, {
         ...fullCfg,
         paginationToken: token,
@@ -485,6 +559,7 @@ async function fetchChunk(
       if (!page?.data?.length) break;
       for (let i = 0; i < page.data.length; i++) txns.push(page.data[i]);
       token = page.paginationToken;
+      pagesFetched++;
     }
   }
 
