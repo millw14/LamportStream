@@ -9,11 +9,14 @@
  *   - Proactive pre-splitting of predicted-hot chunks from scout density
  *   - Recursive hot-chunk subdivision (threshold=65, before pagination triggers)
  *   - MIN_SLOT_SPAN guard prevents wasteful micro-splits
- *   - Dual-layer concurrency control (root limiter + global MAX_INFLIGHT=64)
+ *   - Dual-layer concurrency control (root limiter + global MAX_INFLIGHT cap)
  *   - Undici connection pool (64 persistent keep-alive sockets, reused TLS)
  *   - Stable ordering by (slot, transactionIndex)
+ *   - Explicit finalized / all-history semantics (includes failed txs by default)
  *   - v0 versioned tx support (loadedAddresses → postBalances index mapping)
  *   - Sparse fast-path: ≤100 txns → single call, zero chunking overhead
+ *   - Conditional middle scout for dense / periodic candidates
+ *   - K-way merge to reduce dense-wallet CPU overhead
  *
  * Optimized for lowest average latency across sparse, periodic, and dense wallets.
  *
@@ -24,11 +27,9 @@
 
 import { Pool } from "undici";
 import pLimit from "p-limit";
+import { pathToFileURL } from "node:url";
 
-const API_KEY = process.env.HELIUS_API_KEY;
-if (!API_KEY) throw new Error("HELIUS_API_KEY environment variable is required.");
-
-const RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${API_KEY}`;
+const RPC_ORIGIN = "https://mainnet.helius-rpc.com";
 const HOT = 65;
 const TARGET_TX = 50;
 const MIN_C = 8;
@@ -58,9 +59,13 @@ interface RpcCfg {
   sortOrder?: "desc" | "asc";
   limit?: number;
   paginationToken?: string;
+  commitment?: "finalized" | "confirmed";
   maxSupportedTransactionVersion?: number;
   encoding?: "json";
-  filters?: { slot?: { gte?: number; lt?: number } };
+  filters?: {
+    slot?: { gte?: number; lt?: number };
+    status?: "succeeded" | "failed" | "any";
+  };
 }
 
 interface RpcResult<T> {
@@ -68,7 +73,7 @@ interface RpcResult<T> {
   paginationToken: string | null;
 }
 
-const url = new URL(RPC_URL);
+const url = new URL(RPC_ORIGIN);
 const pool = new Pool(url.origin, {
   connections: 64,
   pipelining: 1,
@@ -76,9 +81,23 @@ const pool = new Pool(url.origin, {
   keepAliveMaxTimeout: 60_000,
 });
 
-const rpcPath = url.pathname + url.search;
 let rpcId = 0;
 let calls = 0;
+
+export interface LamportStreamOptions {
+  apiKey?: string;
+  rootConcurrencyOverride?: number;
+  maxInflightOverride?: number;
+  includeFailedTransactions?: boolean;
+}
+
+export function getRpcCallCount(): number {
+  return calls;
+}
+
+export function resetRpcCallCount(): void {
+  calls = 0;
+}
 
 function retryable(e: unknown): boolean {
   if (!(e instanceof Error)) return true;
@@ -87,7 +106,24 @@ function retryable(e: unknown): boolean {
   return true;
 }
 
+function resolveApiKey(options?: LamportStreamOptions): string {
+  const apiKey = options?.apiKey ?? process.env.HELIUS_API_KEY;
+  if (!apiKey) {
+    throw new Error("HELIUS_API_KEY environment variable is required.");
+  }
+  return apiKey;
+}
+
+function buildRpcPath(apiKey: string): string {
+  return `/?api-key=${encodeURIComponent(apiKey)}`;
+}
+
+function resolveStatusFilter(options?: LamportStreamOptions): "succeeded" | "failed" | "any" {
+  return options?.includeFailedTransactions === false ? "succeeded" : "any";
+}
+
 async function rpc<T>(
+  apiKey: string,
   addr: string,
   cfg: RpcCfg,
   retries = MAX_RETRY,
@@ -104,7 +140,7 @@ async function rpc<T>(
     try {
       calls++;
       const { statusCode, body: responseBody } = await pool.request({
-        path: rpcPath,
+        path: buildRpcPath(apiKey),
         method: "POST",
         headers: { "content-type": "application/json" },
         body,
@@ -127,37 +163,77 @@ async function rpc<T>(
   throw new Error("unreachable");
 }
 
-async function discover(addr: string) {
+async function discover(
+  apiKey: string,
+  addr: string,
+  statusFilter: "succeeded" | "failed" | "any",
+) {
   const [newest, scout] = await Promise.all([
-    rpc<any>(addr, {
+    rpc<any>(apiKey, addr, {
       transactionDetails: "signatures",
       sortOrder: "desc",
       limit: 1,
+      commitment: "finalized",
       maxSupportedTransactionVersion: 0,
+      filters: { status: statusFilter },
     }),
-    rpc<any>(addr, {
+    rpc<any>(apiKey, addr, {
       transactionDetails: "signatures",
       sortOrder: "asc",
       limit: SCOUT_LIM,
+      commitment: "finalized",
       maxSupportedTransactionVersion: 0,
+      filters: { status: statusFilter },
     }),
   ]);
 
   if (!newest.data.length || !scout.data.length) {
-    return { min: 0, max: 0, cnt: 0, range: 0, more: false };
+    return { min: 0, max: 0, cnt: 0, range: 0, more: false, midCnt: 0, midRange: 0 };
   }
 
   const cnt = scout.data.length;
+  let midCnt = 0;
+  let midRange = 0;
+
+  const min = scout.data[0].slot;
+  const max = newest.data[0].slot;
+  const range = scout.data[cnt - 1].slot - scout.data[0].slot + 1;
+  const more = scout.paginationToken !== null;
+
+  if (more || cnt >= 200) {
+    const midpoint = min + Math.floor((max - min) / 2);
+    const halfWindow = Math.max(1, Math.floor(range / 2));
+    const midStart = Math.max(min, midpoint - halfWindow);
+    const midEnd = Math.min(max + 1, midpoint + halfWindow);
+    const mid = await rpc<any>(apiKey, addr, {
+      transactionDetails: "signatures",
+      sortOrder: "asc",
+      limit: SCOUT_LIM,
+      commitment: "finalized",
+      maxSupportedTransactionVersion: 0,
+      filters: {
+        status: statusFilter,
+        slot: { gte: midStart, lt: midEnd },
+      },
+    });
+    if (mid.data.length > 0) {
+      midCnt = mid.data.length;
+      midRange = mid.data[mid.data.length - 1].slot - mid.data[0].slot + 1;
+    }
+  }
+
   return {
-    min: scout.data[0].slot,
-    max: newest.data[0].slot,
+    min,
+    max,
     cnt,
-    range: scout.data[cnt - 1].slot - scout.data[0].slot + 1,
-    more: scout.paginationToken !== null,
+    range,
+    more,
+    midCnt,
+    midRange,
   };
 }
 
-function plan(s: Awaited<ReturnType<typeof discover>>) {
+function plan(s: Awaited<ReturnType<typeof discover>>, options?: LamportStreamOptions) {
   let conc: number;
   let lo: number;
   let hi: number;
@@ -179,7 +255,9 @@ function plan(s: Awaited<ReturnType<typeof discover>>) {
   const total = s.max - s.min;
   if (total <= 0) return { chunks: [{ gte: s.min, lt: s.max + 1 }] as Chunk[], conc };
 
-  const density = s.range > 0 ? s.cnt / s.range : 0.0001;
+  const oldestDensity = s.range > 0 ? s.cnt / s.range : 0.0001;
+  const midDensity = s.midCnt && s.midRange ? s.midCnt / s.midRange : 0;
+  const density = Math.max(oldestDensity, midDensity || 0);
   let chunkCount = Math.ceil(total / Math.max(1, Math.floor(TARGET_TX / Math.max(density, 1e-6))));
   chunkCount = Math.max(lo, Math.min(hi, chunkCount));
   chunkCount = Math.max(MIN_C, Math.min(MAX_C, chunkCount));
@@ -187,7 +265,7 @@ function plan(s: Awaited<ReturnType<typeof discover>>) {
   const step = Math.ceil(total / chunkCount);
   const chunks: Chunk[] = [];
   const scoutEnd = s.min + s.range;
-  const outerDensity = s.more ? density * 1.5 : density * 0.3;
+  const outerDensity = s.more ? density * 1.25 : density * 0.5;
 
   for (let i = 0; i < chunkCount; i++) {
     const gte = s.min + i * step;
@@ -204,17 +282,8 @@ function plan(s: Awaited<ReturnType<typeof discover>>) {
     }
   }
 
-  return { chunks, conc };
+  return { chunks, conc: options?.rootConcurrencyOverride ?? conc };
 }
-
-const globalLimiter = pLimit(MAX_INFLIGHT);
-const FULL_CFG: RpcCfg = {
-  transactionDetails: "full",
-  sortOrder: "asc",
-  limit: FULL_LIM,
-  maxSupportedTransactionVersion: 0,
-  encoding: "json",
-};
 
 function addressIndex(tx: any, addr: string): number {
   const keys = tx.transaction.message.accountKeys;
@@ -286,10 +355,105 @@ function mergeSorted(a: Entry[], b: Entry[]): Entry[] {
   return out;
 }
 
-async function fetchChunk(addr: string, chunk: Chunk, depth: number, timeoutMs: number): Promise<Entry[]> {
+interface HeapNode {
+  arrayIndex: number;
+  entryIndex: number;
+  entry: Entry;
+}
+
+function pushHeap(heap: HeapNode[], node: HeapNode) {
+  heap.push(node);
+  let idx = heap.length - 1;
+  while (idx > 0) {
+    const parent = Math.floor((idx - 1) / 2);
+    if (compareEntries(heap[parent].entry, heap[idx].entry) <= 0) break;
+    [heap[parent], heap[idx]] = [heap[idx], heap[parent]];
+    idx = parent;
+  }
+}
+
+function popHeap(heap: HeapNode[]): HeapNode | undefined {
+  if (heap.length === 0) return undefined;
+  const top = heap[0];
+  const tail = heap.pop();
+  if (heap.length > 0 && tail) {
+    heap[0] = tail;
+    let idx = 0;
+    while (true) {
+      const left = idx * 2 + 1;
+      const right = left + 1;
+      let smallest = idx;
+      if (left < heap.length && compareEntries(heap[left].entry, heap[smallest].entry) < 0) {
+        smallest = left;
+      }
+      if (right < heap.length && compareEntries(heap[right].entry, heap[smallest].entry) < 0) {
+        smallest = right;
+      }
+      if (smallest === idx) break;
+      [heap[idx], heap[smallest]] = [heap[smallest], heap[idx]];
+      idx = smallest;
+    }
+  }
+  return top;
+}
+
+function mergeManySorted(arrays: Entry[][]): Entry[] {
+  const heap: HeapNode[] = [];
+  let totalLength = 0;
+
+  for (let i = 0; i < arrays.length; i++) {
+    if (arrays[i].length > 0) {
+      totalLength += arrays[i].length;
+      pushHeap(heap, { arrayIndex: i, entryIndex: 0, entry: arrays[i][0] });
+    }
+  }
+
+  if (totalLength === 0) return [];
+
+  const merged = new Array<Entry>(totalLength);
+  let outIdx = 0;
+  while (heap.length > 0) {
+    const node = popHeap(heap)!;
+    merged[outIdx++] = node.entry;
+    const nextIndex = node.entryIndex + 1;
+    if (nextIndex < arrays[node.arrayIndex].length) {
+      pushHeap(heap, {
+        arrayIndex: node.arrayIndex,
+        entryIndex: nextIndex,
+        entry: arrays[node.arrayIndex][nextIndex],
+      });
+    }
+  }
+
+  return merged;
+}
+
+function buildFullCfg(statusFilter: "succeeded" | "failed" | "any"): RpcCfg {
+  return {
+    transactionDetails: "full",
+    sortOrder: "asc",
+    limit: FULL_LIM,
+    commitment: "finalized",
+    maxSupportedTransactionVersion: 0,
+    encoding: "json",
+    filters: { status: statusFilter },
+  };
+}
+
+async function fetchChunk(
+  apiKey: string,
+  addr: string,
+  chunk: Chunk,
+  depth: number,
+  timeoutMs: number,
+  statusFilter: "succeeded" | "failed" | "any",
+  globalLimiter: ReturnType<typeof pLimit>,
+): Promise<Entry[]> {
+  const fullCfg = buildFullCfg(statusFilter);
   const result = await rpc<any>(
+    apiKey,
     addr,
-    { ...FULL_CFG, filters: { slot: { gte: chunk.gte, lt: chunk.lt } } },
+    { ...fullCfg, filters: { ...fullCfg.filters, slot: { gte: chunk.gte, lt: chunk.lt } } },
     2,
     timeoutMs,
   );
@@ -303,8 +467,8 @@ async function fetchChunk(addr: string, chunk: Chunk, depth: number, timeoutMs: 
   if ((hot || paginated) && span > MIN_SPAN && depth < 10) {
     const mid = chunk.gte + (span >> 1);
     const [left, right] = await Promise.all([
-      globalLimiter(() => fetchRetry(addr, { gte: chunk.gte, lt: mid }, depth + 1)),
-      globalLimiter(() => fetchRetry(addr, { gte: mid, lt: chunk.lt }, depth + 1)),
+      globalLimiter(() => fetchRetry(apiKey, addr, { gte: chunk.gte, lt: mid }, depth + 1, statusFilter, globalLimiter)),
+      globalLimiter(() => fetchRetry(apiKey, addr, { gte: mid, lt: chunk.lt }, depth + 1, statusFilter, globalLimiter)),
     ]);
     return mergeSorted(left, right);
   }
@@ -313,10 +477,10 @@ async function fetchChunk(addr: string, chunk: Chunk, depth: number, timeoutMs: 
   if (paginated) {
     let token: string | null = result.paginationToken;
     while (token) {
-      const page = await rpc<any>(addr, {
-        ...FULL_CFG,
+      const page = await rpc<any>(apiKey, addr, {
+        ...fullCfg,
         paginationToken: token,
-        filters: { slot: { gte: chunk.gte, lt: chunk.lt } },
+        filters: { ...fullCfg.filters, slot: { gte: chunk.gte, lt: chunk.lt } },
       });
       if (!page?.data?.length) break;
       for (let i = 0; i < page.data.length; i++) txns.push(page.data[i]);
@@ -327,32 +491,42 @@ async function fetchChunk(addr: string, chunk: Chunk, depth: number, timeoutMs: 
   return toEntries(txns, addr);
 }
 
-async function fetchRetry(addr: string, chunk: Chunk, depth: number): Promise<Entry[]> {
+async function fetchRetry(
+  apiKey: string,
+  addr: string,
+  chunk: Chunk,
+  depth: number,
+  statusFilter: "succeeded" | "failed" | "any",
+  globalLimiter: ReturnType<typeof pLimit>,
+): Promise<Entry[]> {
   try {
-    return await fetchChunk(addr, chunk, depth, TIMEOUT);
+    return await fetchChunk(apiKey, addr, chunk, depth, TIMEOUT, statusFilter, globalLimiter);
   } catch {
-    return fetchChunk(addr, chunk, depth, TIMEOUT * 2);
+    return fetchChunk(apiKey, addr, chunk, depth, TIMEOUT * 2, statusFilter, globalLimiter);
   }
 }
 
-export async function getSOLBalanceOverTime(address: string): Promise<Entry[]> {
-  const scout = await discover(address);
+export async function getSOLBalanceOverTime(
+  address: string,
+  options?: LamportStreamOptions,
+): Promise<Entry[]> {
+  const apiKey = resolveApiKey(options);
+  const statusFilter = resolveStatusFilter(options);
+  const scout = await discover(apiKey, address, statusFilter);
   if (scout.cnt === 0) return [];
 
   if (scout.cnt < 50 && !scout.more && scout.cnt <= FULL_LIM) {
-    const result = await rpc<any>(address, {
-      transactionDetails: "full",
-      sortOrder: "asc",
-      limit: FULL_LIM,
-      maxSupportedTransactionVersion: 0,
-      encoding: "json",
+    const fullCfg = buildFullCfg(statusFilter);
+    const result = await rpc<any>(apiKey, address, {
+      ...fullCfg,
     });
     return toEntries(result.data, address);
   }
 
-  const { chunks, conc } = plan(scout);
+  const { chunks, conc } = plan(scout, options);
+  const globalLimiter = pLimit(options?.maxInflightOverride ?? MAX_INFLIGHT);
   const rootLimiter = pLimit(conc);
-  let merged: Entry[] = [];
+  const completed: Entry[][] = [];
 
   await new Promise<void>((resolve, reject) => {
     let finished = 0;
@@ -363,15 +537,17 @@ export async function getSOLBalanceOverTime(address: string): Promise<Entry[]> {
     }
 
     for (const chunk of chunks) {
-      rootLimiter(() => globalLimiter(() => fetchRetry(address, chunk, 0)))
+      rootLimiter(() => globalLimiter(() =>
+        fetchRetry(apiKey, address, chunk, 0, statusFilter, globalLimiter)))
         .then((entries) => {
-          if (entries.length > 0) merged = mergeSorted(merged, entries);
+          if (entries.length > 0) completed.push(entries);
           if (++finished === total) resolve();
         })
         .catch(reject);
     }
   });
 
+  const merged = mergeManySorted(completed);
   if (merged.length <= 1) return merged;
 
   const seen = new Set<string>();
@@ -385,20 +561,32 @@ export async function getSOLBalanceOverTime(address: string): Promise<Entry[]> {
   return out;
 }
 
-const address = process.argv[2];
-if (!address) {
-  console.error("Usage: npx tsx lamport-stream.ts <ADDRESS>");
-  process.exit(1);
+function isDirectRun(): boolean {
+  const entry = process.argv[1];
+  return Boolean(entry) && import.meta.url === pathToFileURL(entry).href;
 }
 
-calls = 0;
-const start = performance.now();
-getSOLBalanceOverTime(address).then((history) => {
-  const elapsed = performance.now() - start;
-  console.log(JSON.stringify(history));
-  console.error(`${history.length} entries | ${elapsed.toFixed(0)}ms | ${calls} RPC calls`);
-}).catch((err) => {
-  const elapsed = performance.now() - start;
-  console.error(`Error after ${elapsed.toFixed(0)}ms (${calls} calls):`, err);
-  process.exit(1);
-});
+async function main() {
+  const address = process.argv[2];
+  if (!address) {
+    console.error("Usage: npx tsx lamport-stream.ts <ADDRESS>");
+    process.exit(1);
+  }
+
+  calls = 0;
+  const start = performance.now();
+  try {
+    const history = await getSOLBalanceOverTime(address);
+    const elapsed = performance.now() - start;
+    console.log(JSON.stringify(history));
+    console.error(`${history.length} entries | ${elapsed.toFixed(0)}ms | ${calls} RPC calls`);
+  } catch (err) {
+    const elapsed = performance.now() - start;
+    console.error(`Error after ${elapsed.toFixed(0)}ms (${calls} calls):`, err);
+    process.exit(1);
+  }
+}
+
+if (isDirectRun()) {
+  void main();
+}

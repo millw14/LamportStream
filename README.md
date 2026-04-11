@@ -4,7 +4,15 @@ Ultra-low latency SOL balance history computation using Helius `getTransactionsF
 
 This repo is a competition entry for the Helius mini Solana dev weekend challenge: compute SOL balance over time at runtime, with no indexing, using only RPC.
 
-## What it does
+## Canonical file
+
+The one file to submit, benchmark, or hand to Mert is:
+
+- `lamport-stream.ts`
+
+That file is the canonical artifact. The `src/` directory exists as support code for development, but the benchmark harness runs `lamport-stream.ts` directly.
+
+## What it returns
 
 Given a wallet address, LamportStream returns a chronologically ordered balance history:
 
@@ -20,7 +28,20 @@ Given a wallet address, LamportStream returns a chronologically ordered balance 
 ]
 ```
 
-Each row represents the wallet's SOL balance immediately after a transaction touching that wallet.
+Each row is the wallet's SOL balance immediately after a finalized transaction touching that address.
+
+## Correctness semantics
+
+LamportStream is explicit about history semantics:
+
+- `commitment: "finalized"`
+- `filters.status: "any"` by default
+- failed transactions are included because they can still change SOL balance through fees
+- ordering is preserved by `(slot, transactionIndex)`
+- duplicate signatures are removed after merge
+- versioned transactions are handled via `loadedAddresses`
+
+If you want success-only history instead, the exported function accepts `includeFailedTransactions: false`.
 
 ## Why it is fast
 
@@ -28,30 +49,29 @@ LamportStream is optimized around the real bottleneck for this problem: minimizi
 
 Key techniques:
 
-- 2-call parallel discovery: newest slot + ascending scout pass
+- 2-call parallel discovery: newest slot + ascending oldest scout
+- Conditional middle scout only for dense / periodic candidates
 - Density-aware adaptive chunking
 - Adaptive root concurrency: `8 / 24 / 48`
 - Proactive hot-range pre-splitting from scout density
 - Recursive hot-chunk subdivision before pagination becomes expensive
-- Global `MAX_INFLIGHT=64` guard
-- Undici connection pooling with keep-alive
-- Stable merge ordering by `(slot, transactionIndex)`
-- Versioned transaction support via `loadedAddresses`
-- Sparse wallet fast-path: skip chunking for tiny histories
+- Global inflight cap with connection pooling
+- K-way merge over completed chunk outputs to reduce copy and GC overhead
+- Sparse wallet fast-path for tiny histories
 
 ## Project layout
 
 ```text
-lamport-stream.ts   # self-contained, gist-ready submission file
+lamport-stream.ts   # canonical self-contained submission file
 src/
-  cli.ts            # command-line runner
-  index.ts          # library entrypoint
+  cli.ts            # secondary modular CLI runner
+  index.ts          # secondary modular library entrypoint
   rpc.ts            # pooled HTTP transport + retry logic
   discovery.ts      # scout phase
   classifier.ts     # density classification
   chunker.ts        # adaptive slot-range planning
   fetcher.ts        # parallel fetch, recursive split, merge
-  benchmark.ts      # benchmark and validation harness
+  benchmark.ts      # benchmark matrix for the canonical file
   types.ts          # shared types
   constants.ts      # tuning knobs
 ```
@@ -75,7 +95,7 @@ npm install
 
 ## Run
 
-Modular CLI:
+Canonical submission file:
 
 ```bash
 npm start -- <SOLANA_ADDRESS>
@@ -84,53 +104,35 @@ npm start -- <SOLANA_ADDRESS>
 Direct TypeScript entry:
 
 ```bash
-npx tsx src/cli.ts <SOLANA_ADDRESS>
+npx tsx lamport-stream.ts <SOLANA_ADDRESS>
 ```
 
-Gist-ready standalone file:
+Secondary modular runner:
 
 ```bash
-npx tsx lamport-stream.ts <SOLANA_ADDRESS>
+npx tsx src/cli.ts <SOLANA_ADDRESS>
 ```
 
 ## Benchmark
 
-Run against sparse, periodic, and dense wallets:
+Run the canonical submission file against sparse, periodic, and dense wallets:
 
 ```bash
 npm run benchmark -- <sparse_addr> <periodic_addr> <dense_addr>
 ```
 
+The benchmark sweeps:
+
+- root concurrency: `40`, `48`, `56`
+- inflight cap: `56`, `64`, `72`
+
 The benchmark reports:
 
-- total elapsed time
+- elapsed time
 - RPC call count
 - duplicate signature detection
 - stable ordering checks using `(slot, transactionIndex)`
-
-## Implementation notes
-
-### Correctness
-
-- Preserves intra-slot ordering using `transactionIndex`
-- Handles versioned transactions with address lookup tables
-- Deduplicates by signature after merge
-- Avoids CLI side effects when importing library code
-
-### Performance
-
-- Avoids binary search discovery
-- Prevents recursive limiter starvation on dense wallets
-- Keeps chunk sizing below the expensive pagination boundary when possible
-- Fails fast on missing API key and non-retryable errors
-
-## Submission file
-
-If you want to submit just one file, use:
-
-- `lamport-stream.ts`
-
-It contains the full algorithm in a single self-contained file suitable for a gist or tweet reply.
+- the best configuration across the provided wallet set
 
 ## Scripts
 

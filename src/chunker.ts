@@ -9,13 +9,17 @@ export function computeChunks(
   const totalSlotRange = scout.maxSlot - scout.minSlot;
   if (totalSlotRange <= 0) return [{ gte: scout.minSlot, lt: scout.maxSlot + 1 }];
 
-  const estimatedTxPerSlot = scout.scoutSlotRange > 0
+  const oldestDensity = scout.scoutSlotRange > 0
     ? scout.scoutCount / scout.scoutSlotRange
     : 0.0001;
+  const midDensity = scout.midScoutCount && scout.midScoutSlotRange
+    ? scout.midScoutCount / scout.midScoutSlotRange
+    : 0;
+  const referenceDensity = Math.max(oldestDensity, midDensity || 0);
 
   const chunkSlotSize = Math.max(
     1,
-    Math.floor(TARGET_TX_PER_CHUNK / Math.max(estimatedTxPerSlot, 0.000001)),
+    Math.floor(TARGET_TX_PER_CHUNK / Math.max(referenceDensity, 0.000001)),
   );
 
   let numChunks = Math.ceil(totalSlotRange / chunkSlotSize);
@@ -26,9 +30,7 @@ export function computeChunks(
   const chunks: ChunkDef[] = [];
 
   const scoutEndSlot = scout.minSlot + scout.scoutSlotRange;
-  const scoutDensity = scout.scoutSlotRange > 0 ? scout.scoutCount / scout.scoutSlotRange : 0;
-  const restSlotRange = scout.maxSlot - scoutEndSlot;
-  const expectedDensityOutside = scout.hasMore ? scoutDensity * 1.5 : scoutDensity * 0.3;
+  const expectedDensityOutside = scout.hasMore ? referenceDensity * 1.25 : referenceDensity * 0.5;
 
   for (let i = 0; i < numChunks; i++) {
     const gte = scout.minSlot + i * actualChunkSize;
@@ -39,7 +41,7 @@ export function computeChunks(
 
     const chunkSpan = lt - gte;
     const isInScoutRange = gte < scoutEndSlot;
-    const localDensity = isInScoutRange ? scoutDensity : expectedDensityOutside;
+    const localDensity = isInScoutRange ? referenceDensity : expectedDensityOutside;
     const expectedTxns = localDensity * chunkSpan;
 
     if (expectedTxns > 90 && chunkSpan > 1) {

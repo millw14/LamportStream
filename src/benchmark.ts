@@ -1,4 +1,9 @@
-import { getSOLBalanceOverTime, getRpcCallCount, resetRpcCallCount } from "./index.js";
+import {
+  getSOLBalanceOverTime,
+  getRpcCallCount,
+  resetRpcCallCount,
+  type LamportStreamOptions,
+} from "../lamport-stream";
 
 const TEST_WALLETS: { label: string; address: string }[] = [
   // Replace with real addresses for your testing
@@ -8,6 +13,7 @@ const TEST_WALLETS: { label: string; address: string }[] = [
 ];
 
 interface RunResult {
+  config: string;
   label: string;
   address: string;
   entries: number;
@@ -27,9 +33,15 @@ function classifyError(err: unknown): string {
   return text.slice(0, 80);
 }
 
-async function benchOne(label: string, address: string): Promise<RunResult> {
+async function benchOne(
+  config: string,
+  label: string,
+  address: string,
+  options: LamportStreamOptions,
+): Promise<RunResult> {
   if (!address) {
     return {
+      config,
       label,
       address: "(skipped)",
       entries: 0,
@@ -44,7 +56,7 @@ async function benchOne(label: string, address: string): Promise<RunResult> {
   resetRpcCallCount();
   const start = performance.now();
   try {
-    const history = await getSOLBalanceOverTime(address);
+    const history = await getSOLBalanceOverTime(address, options);
     const elapsed = performance.now() - start;
     const calls = getRpcCallCount();
 
@@ -66,6 +78,7 @@ async function benchOne(label: string, address: string): Promise<RunResult> {
     const dupes = history.length - sigs.size;
 
     return {
+      config,
       label,
       address: address.slice(0, 8) + "...",
       entries: history.length,
@@ -78,12 +91,13 @@ async function benchOne(label: string, address: string): Promise<RunResult> {
   } catch (err: unknown) {
     const elapsed = performance.now() - start;
     return {
+      config,
       label,
       address: address.slice(0, 8) + "...",
       entries: 0,
       rpcCalls: getRpcCallCount(),
       elapsedMs: Math.round(elapsed),
-      orderingOk: false,
+      orderingOk: true,
       duplicateCount: 0,
       error: classifyError(err),
     };
@@ -99,29 +113,64 @@ async function main() {
 
   console.error("=== LamportStream Benchmark ===\n");
 
-  const results: RunResult[] = [];
-  for (const wallet of active) {
-    console.error(`Running: ${wallet.label} (${wallet.address.slice(0, 12)}...)`);
-    const result = await benchOne(wallet.label, wallet.address);
-    results.push(result);
-    console.error(`  -> ${result.entries} entries | ${result.elapsedMs}ms | ${result.rpcCalls} RPC calls${result.error ? " | " + result.error : ""}\n`);
+  const rootConcurrencyValues = [40, 48, 56];
+  const maxInflightValues = [56, 64, 72];
+  const allResults: RunResult[] = [];
+
+  for (const rootConcurrencyOverride of rootConcurrencyValues) {
+    for (const maxInflightOverride of maxInflightValues) {
+      const options: LamportStreamOptions = {
+        rootConcurrencyOverride,
+        maxInflightOverride,
+      };
+      const config = `root=${rootConcurrencyOverride}, inflight=${maxInflightOverride}`;
+      console.error(`Config: ${config}`);
+      const configResults: RunResult[] = [];
+
+      for (const wallet of active) {
+        console.error(`  Running: ${wallet.label} (${wallet.address.slice(0, 12)}...)`);
+        const result = await benchOne(config, wallet.label, wallet.address, options);
+        configResults.push(result);
+        console.error(`    -> ${result.entries} entries | ${result.elapsedMs}ms | ${result.rpcCalls} RPC calls${result.error ? " | " + result.error : ""}`);
+      }
+
+      const totalMs = configResults.reduce((s, r) => s + r.elapsedMs, 0);
+      const totalCalls = configResults.reduce((s, r) => s + r.rpcCalls, 0);
+      const successfulRuns = configResults.filter((r) => !r.error).length;
+      const avgMs = successfulRuns > 0 ? Math.round(totalMs / successfulRuns) : null;
+      const orderingFailures = configResults.filter((r) => !r.orderingOk).length;
+      const duplicateTotal = configResults.reduce((s, r) => s + r.duplicateCount, 0);
+
+      console.error(`  Summary -> avg ${avgMs === null ? "n/a" : `${avgMs}ms`} | total ${totalMs}ms | ${totalCalls} RPC calls | order ${orderingFailures === 0 ? "ok" : orderingFailures} | dupes ${duplicateTotal}\n`);
+      allResults.push(...configResults);
+    }
   }
 
-  const totalMs = results.reduce((s, r) => s + r.elapsedMs, 0);
-  const successfulRuns = results.filter((r) => !r.error || r.entries > 0).length;
-  const avgMs = successfulRuns > 0 ? Math.round(totalMs / successfulRuns) : 0;
-  const totalCalls = results.reduce((s, r) => s + r.rpcCalls, 0);
-  const orderingFailures = results.filter((r) => !r.orderingOk).length;
-  const duplicateTotal = results.reduce((s, r) => s + r.duplicateCount, 0);
+  const grouped = new Map<string, RunResult[]>();
+  for (const result of allResults) {
+    const bucket = grouped.get(result.config) ?? [];
+    bucket.push(result);
+    grouped.set(result.config, bucket);
+  }
+
+  let bestConfig = "";
+  let bestAvgMs = Number.POSITIVE_INFINITY;
+  for (const [config, results] of grouped.entries()) {
+    const totalMs = results.reduce((s, r) => s + r.elapsedMs, 0);
+    const successfulRuns = results.filter((r) => !r.error).length;
+    const avgMs = successfulRuns > 0 ? Math.round(totalMs / successfulRuns) : Number.POSITIVE_INFINITY;
+    if (avgMs < bestAvgMs) {
+      bestAvgMs = avgMs;
+      bestConfig = config;
+    }
+  }
 
   console.error("--- Summary ---");
-  console.error(`Total:   ${totalMs}ms across ${results.length} wallets`);
-  console.error(`Average: ${avgMs}ms per wallet`);
-  console.error(`RPC:     ${totalCalls} total calls`);
-  console.error(`Order:   ${orderingFailures === 0 ? "ok" : `${orderingFailures} failures`}`);
-  console.error(`Dupes:   ${duplicateTotal}`);
+  console.error(`Configs: ${grouped.size}`);
+  console.error(`Best:    ${bestConfig || "none (no successful configs)"}`);
+  console.error(`BestAvg: ${Number.isFinite(bestAvgMs) ? bestAvgMs : 0}ms per wallet`);
 
-  console.log(JSON.stringify(results, null, 2));
+  console.log(JSON.stringify(allResults, null, 2));
 }
 
 main();

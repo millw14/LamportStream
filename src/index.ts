@@ -20,8 +20,10 @@ export async function getSOLBalanceOverTime(address: string): Promise<BalanceEnt
       transactionDetails: "full",
       sortOrder: "asc",
       limit: FULL_TX_LIMIT,
+      commitment: "finalized",
       maxSupportedTransactionVersion: 0,
       encoding: "json",
+      filters: { status: "any" },
     });
     return extractInline(result.data, address);
   }

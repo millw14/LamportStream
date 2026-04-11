@@ -96,6 +96,8 @@ export interface ScoutResult {
   scoutCount: number;
   scoutSlotRange: number;
   hasMore: boolean;
+  midScoutCount?: number;
+  midScoutSlotRange?: number;
 }
 
 export interface BalanceEntry {

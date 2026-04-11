@@ -15,6 +15,7 @@ const BASE_CONFIG = {
   transactionDetails: "full" as const,
   sortOrder: "asc" as const,
   limit: FULL_TX_LIMIT,
+  commitment: "finalized" as const,
   maxSupportedTransactionVersion: 0,
   encoding: "json" as const,
 };
@@ -75,7 +76,7 @@ async function fetchChunk(
 ): Promise<BalanceEntry[]> {
   const result = await rpcCall<FullTransaction>(
     address,
-    { ...BASE_CONFIG, filters: { slot: { gte: chunk.gte, lt: chunk.lt } } },
+    { ...BASE_CONFIG, filters: { slot: { gte: chunk.gte, lt: chunk.lt }, status: "any" } },
     2,
     timeoutMs,
   );
@@ -104,7 +105,7 @@ async function fetchChunk(
         await rpcCall<FullTransaction>(address, {
           ...BASE_CONFIG,
           paginationToken: token,
-          filters: { slot: { gte: chunk.gte, lt: chunk.lt } },
+          filters: { slot: { gte: chunk.gte, lt: chunk.lt }, status: "any" },
         });
       if (!page?.data?.length) break;
       for (let i = 0; i < page.data.length; i++) txns.push(page.data[i]);
@@ -140,13 +141,88 @@ function mergeSorted(a: BalanceEntry[], b: BalanceEntry[]): BalanceEntry[] {
   return out;
 }
 
+interface HeapNode {
+  arrayIndex: number;
+  entryIndex: number;
+  entry: BalanceEntry;
+}
+
+function pushHeap(heap: HeapNode[], node: HeapNode) {
+  heap.push(node);
+  let idx = heap.length - 1;
+  while (idx > 0) {
+    const parent = Math.floor((idx - 1) / 2);
+    if (compareEntries(heap[parent].entry, heap[idx].entry) <= 0) break;
+    [heap[parent], heap[idx]] = [heap[idx], heap[parent]];
+    idx = parent;
+  }
+}
+
+function popHeap(heap: HeapNode[]): HeapNode | undefined {
+  if (heap.length === 0) return undefined;
+  const top = heap[0];
+  const tail = heap.pop();
+  if (heap.length > 0 && tail) {
+    heap[0] = tail;
+    let idx = 0;
+    while (true) {
+      const left = idx * 2 + 1;
+      const right = left + 1;
+      let smallest = idx;
+
+      if (left < heap.length && compareEntries(heap[left].entry, heap[smallest].entry) < 0) {
+        smallest = left;
+      }
+      if (right < heap.length && compareEntries(heap[right].entry, heap[smallest].entry) < 0) {
+        smallest = right;
+      }
+      if (smallest === idx) break;
+      [heap[idx], heap[smallest]] = [heap[smallest], heap[idx]];
+      idx = smallest;
+    }
+  }
+  return top;
+}
+
+function mergeManySorted(arrays: BalanceEntry[][]): BalanceEntry[] {
+  const heap: HeapNode[] = [];
+  let totalLength = 0;
+
+  for (let i = 0; i < arrays.length; i++) {
+    if (arrays[i].length > 0) {
+      totalLength += arrays[i].length;
+      pushHeap(heap, { arrayIndex: i, entryIndex: 0, entry: arrays[i][0] });
+    }
+  }
+
+  if (totalLength === 0) return [];
+
+  const merged = new Array<BalanceEntry>(totalLength);
+  let outIdx = 0;
+
+  while (heap.length > 0) {
+    const node = popHeap(heap)!;
+    merged[outIdx++] = node.entry;
+    const nextIndex = node.entryIndex + 1;
+    if (nextIndex < arrays[node.arrayIndex].length) {
+      pushHeap(heap, {
+        arrayIndex: node.arrayIndex,
+        entryIndex: nextIndex,
+        entry: arrays[node.arrayIndex][nextIndex],
+      });
+    }
+  }
+
+  return merged;
+}
+
 export async function fetchAndProcess(
   address: string,
   chunks: ChunkDef[],
   concurrency: number,
 ): Promise<BalanceEntry[]> {
   const rootLimiter = pLimit(concurrency);
-  let merged: BalanceEntry[] = [];
+  const completed: BalanceEntry[][] = [];
 
   await new Promise<void>((resolve, reject) => {
     let finished = 0;
@@ -156,13 +232,14 @@ export async function fetchAndProcess(
     for (const chunk of chunks) {
       rootLimiter(() => globalLimiter(() => fetchRetry(address, chunk, 0)))
         .then((entries) => {
-          if (entries.length > 0) merged = mergeSorted(merged, entries);
+          if (entries.length > 0) completed.push(entries);
           if (++finished === total) resolve();
         })
         .catch(reject);
     }
   });
 
+  const merged = mergeManySorted(completed);
   if (merged.length <= 1) return merged;
   const seen = new Set<string>();
   const out: BalanceEntry[] = [];
