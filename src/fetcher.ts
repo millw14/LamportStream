@@ -7,7 +7,14 @@ import {
   MIN_SLOT_SPAN,
   REQUEST_TIMEOUT_MS,
 } from "./constants.js";
-import type { ChunkDef, FullTransaction, BalanceEntry } from "./types.js";
+import type {
+  ChunkDef,
+  FullTransaction,
+  BalanceEntry,
+  SignatureEntry,
+  SignatureSampleSummary,
+  HotBandDef,
+} from "./types.js";
 
 const globalLimiter = pLimit(MAX_INFLIGHT);
 
@@ -21,6 +28,18 @@ const BASE_CONFIG = {
 };
 
 const MAX_PAGES_PER_CHUNK = 32;
+const MAX_SIGNATURE_PAGES_PER_CHUNK = 4;
+const TARGET_SIGNATURES_PER_BAND = 80;
+const MAX_HOT_BANDS = 12;
+const MAX_SIGNATURE_PAGES_PER_ULTRA_DENSE_CHUNK = 12;
+const MAX_ULTRA_DENSE_HOT_BANDS = 24;
+const SIGNATURES_BASE_CONFIG = {
+  transactionDetails: "signatures" as const,
+  sortOrder: "asc" as const,
+  limit: 1000,
+  commitment: "finalized" as const,
+  maxSupportedTransactionVersion: 0,
+};
 
 function findIdx(tx: FullTransaction, address: string): number {
   const keys = tx.transaction.message.accountKeys;
@@ -70,12 +89,160 @@ function compareEntries(a: BalanceEntry, b: BalanceEntry): number {
   return a.signature.localeCompare(b.signature);
 }
 
+async function sampleChunkSignatures(
+  address: string,
+  chunk: ChunkDef,
+  timeoutMs: number,
+  maxPages: number,
+): Promise<SignatureSampleSummary> {
+  const entries: SignatureEntry[] = [];
+  const seenTokens = new Set<string>();
+  let token: string | null = null;
+  let pagesFetched = 0;
+
+  do {
+    const page: { data: SignatureEntry[]; paginationToken: string | null } = await rpcCall<SignatureEntry>(
+      address,
+      {
+        ...SIGNATURES_BASE_CONFIG,
+        paginationToken: token ?? undefined,
+        filters: { slot: { gte: chunk.gte, lt: chunk.lt }, status: "any" },
+      },
+      1,
+      timeoutMs,
+    );
+    pagesFetched++;
+
+    if (page?.data?.length) {
+      for (let i = 0; i < page.data.length; i++) entries.push(page.data[i]);
+    } else {
+      return { entries, hasMore: false, pagesFetched };
+    }
+
+    token = page.paginationToken;
+    if (!token || seenTokens.has(token) || pagesFetched >= maxPages) {
+      return { entries, hasMore: Boolean(token), pagesFetched };
+    }
+    seenTokens.add(token);
+  } while (token);
+
+  return { entries, hasMore: false, pagesFetched };
+}
+
+function buildHotBands(chunk: ChunkDef, sample: SignatureSampleSummary, maxBands: number): HotBandDef[] {
+  if (sample.entries.length === 0) return [];
+
+  const groupSize = Math.max(
+    TARGET_SIGNATURES_PER_BAND,
+    Math.ceil(sample.entries.length / maxBands),
+  );
+
+  const bands: HotBandDef[] = [];
+  let idx = 0;
+  while (idx < sample.entries.length) {
+    const startSlot = sample.entries[idx].slot;
+    let endIdx = Math.min(idx + groupSize - 1, sample.entries.length - 1);
+    while (
+      endIdx + 1 < sample.entries.length &&
+      sample.entries[endIdx + 1].slot === sample.entries[endIdx].slot
+    ) {
+      endIdx++;
+    }
+
+    const endSlot = sample.entries[endIdx].slot + 1;
+    if (endSlot > startSlot) {
+      bands.push({
+        gte: startSlot,
+        lt: endSlot,
+        observedSignatures: endIdx - idx + 1,
+        exact: !sample.hasMore || endIdx < sample.entries.length - 1,
+      });
+    }
+    idx = endIdx + 1;
+  }
+
+  if (sample.hasMore) {
+    const tailStart = sample.entries[sample.entries.length - 1].slot + 1;
+    if (tailStart < chunk.lt) {
+      bands.push({
+        gte: tailStart,
+        lt: chunk.lt,
+        observedSignatures: 0,
+        exact: false,
+      });
+    }
+  }
+
+  const normalized: HotBandDef[] = [];
+  for (let i = 0; i < bands.length; i++) {
+    const band = bands[i];
+    const gte = Math.max(chunk.gte, band.gte);
+    const lt = Math.min(chunk.lt, band.lt);
+    if (lt <= gte) continue;
+
+    const prev = normalized[normalized.length - 1];
+    if (prev && gte <= prev.lt) {
+      prev.lt = Math.max(prev.lt, lt);
+      prev.observedSignatures += band.observedSignatures;
+      prev.exact = prev.exact && band.exact;
+    } else {
+      normalized.push({ ...band, gte, lt });
+    }
+  }
+
+  return normalized;
+}
+
+async function refineChunkWithSignatures(
+  address: string,
+  chunk: ChunkDef,
+  depth: number,
+  timeoutMs: number,
+  useSignatureHotBands: boolean,
+): Promise<BalanceEntry[] | null> {
+  const sample = await sampleChunkSignatures(
+    address,
+    chunk,
+    timeoutMs,
+    useSignatureHotBands ? MAX_SIGNATURE_PAGES_PER_ULTRA_DENSE_CHUNK : MAX_SIGNATURE_PAGES_PER_CHUNK,
+  );
+  const hotBands = buildHotBands(
+    chunk,
+    sample,
+    useSignatureHotBands ? MAX_ULTRA_DENSE_HOT_BANDS : MAX_HOT_BANDS,
+  );
+  if (hotBands.length <= 1) return null;
+
+  const childChunks = hotBands.map((band) => ({ gte: band.gte, lt: band.lt }));
+  if (
+    childChunks.length === 1 &&
+    childChunks[0].gte === chunk.gte &&
+    childChunks[0].lt === chunk.lt
+  ) {
+    return null;
+  }
+
+  const completed = await Promise.all(
+    childChunks.map((child) => globalLimiter(() => fetchRetry(address, child, depth + 1, useSignatureHotBands))),
+  );
+  return mergeManySorted(completed);
+}
+
 async function fetchChunk(
   address: string,
   chunk: ChunkDef,
   depth: number,
   timeoutMs: number,
+  useSignatureHotBands: boolean,
 ): Promise<BalanceEntry[]> {
+  const span = chunk.lt - chunk.gte;
+  const shouldRefineBeforeFull = useSignatureHotBands && depth < 6 && span > MIN_SLOT_SPAN;
+
+  if (shouldRefineBeforeFull) {
+    const refined = await refineChunkWithSignatures(address, chunk, depth, timeoutMs, useSignatureHotBands);
+    if (refined) return refined;
+  }
+
   const result = await rpcCall<FullTransaction>(
     address,
     { ...BASE_CONFIG, filters: { slot: { gte: chunk.gte, lt: chunk.lt }, status: "any" } },
@@ -87,16 +254,21 @@ async function fetchChunk(
 
   const isHot = result.data.length >= HOT_CHUNK_THRESHOLD;
   const hasPagination = result.paginationToken !== null;
-  const span = chunk.lt - chunk.gte;
   const canSplit = span > MIN_SLOT_SPAN && depth < 10;
   const shouldSplit = canSplit && (isHot || result.data.length >= FULL_TX_LIMIT);
   const shouldPaginate = hasPagination && result.data.length >= FULL_TX_LIMIT;
+  const shouldUseSignatureBands = useSignatureHotBands && result.data.length >= FULL_TX_LIMIT;
 
   if (shouldSplit) {
+    if (shouldUseSignatureBands) {
+      const refined = await refineChunkWithSignatures(address, chunk, depth, timeoutMs, useSignatureHotBands);
+      if (refined) return refined;
+    }
+
     const mid = chunk.gte + (span >> 1);
     const [left, right] = await Promise.all([
-      globalLimiter(() => fetchRetry(address, { gte: chunk.gte, lt: mid }, depth + 1)),
-      globalLimiter(() => fetchRetry(address, { gte: mid, lt: chunk.lt }, depth + 1)),
+      globalLimiter(() => fetchRetry(address, { gte: chunk.gte, lt: mid }, depth + 1, useSignatureHotBands)),
+      globalLimiter(() => fetchRetry(address, { gte: mid, lt: chunk.lt }, depth + 1, useSignatureHotBands)),
     ]);
     return mergeSorted(left, right);
   }
@@ -128,11 +300,12 @@ async function fetchRetry(
   address: string,
   chunk: ChunkDef,
   depth: number,
+  useSignatureHotBands: boolean,
 ): Promise<BalanceEntry[]> {
   try {
-    return await fetchChunk(address, chunk, depth, REQUEST_TIMEOUT_MS);
+    return await fetchChunk(address, chunk, depth, REQUEST_TIMEOUT_MS, useSignatureHotBands);
   } catch {
-    return fetchChunk(address, chunk, depth, REQUEST_TIMEOUT_MS * 2);
+    return fetchChunk(address, chunk, depth, REQUEST_TIMEOUT_MS * 2, useSignatureHotBands);
   }
 }
 
@@ -228,6 +401,7 @@ export async function fetchAndProcess(
   address: string,
   chunks: ChunkDef[],
   concurrency: number,
+  useSignatureHotBands: boolean,
 ): Promise<BalanceEntry[]> {
   const rootLimiter = pLimit(concurrency);
   const completed: BalanceEntry[][] = [];
@@ -238,7 +412,7 @@ export async function fetchAndProcess(
     if (total === 0) { resolve(); return; }
 
     for (const chunk of chunks) {
-      rootLimiter(() => globalLimiter(() => fetchRetry(address, chunk, 0)))
+      rootLimiter(() => globalLimiter(() => fetchRetry(address, chunk, 0, useSignatureHotBands)))
         .then((entries) => {
           if (entries.length > 0) completed.push(entries);
           if (++finished === total) resolve();

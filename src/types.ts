@@ -70,9 +70,23 @@ export interface FullTransaction {
 
 export interface SignatureEntry {
   slot: number;
+  transactionIndex: number;
   signature: string;
   blockTime: number | null;
   err: unknown;
+}
+
+export interface SignatureSampleSummary {
+  entries: SignatureEntry[];
+  hasMore: boolean;
+  pagesFetched: number;
+}
+
+export interface HotBandDef {
+  gte: number;
+  lt: number;
+  observedSignatures: number;
+  exact: boolean;
 }
 
 export interface RpcResponse<T> {

@@ -29,7 +29,7 @@ export async function getSOLBalanceOverTime(address: string): Promise<BalanceEnt
   }
 
   const chunks = computeChunks(scout, classification);
-  return fetchAndProcess(address, chunks, classification.concurrency);
+  return fetchAndProcess(address, chunks, classification.concurrency, classification.useSignatureHotBands);
 }
 
 function extractInline(txns: FullTransaction[], address: string): BalanceEntry[] {

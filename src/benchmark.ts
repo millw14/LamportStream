@@ -1,6 +1,7 @@
 import {
   getSOLBalanceOverTime,
   getRpcCallCount,
+  getRpcBreakdown,
   resetRpcCallCount,
   type LamportStreamOptions,
 } from "../lamport-stream";
@@ -18,6 +19,8 @@ interface RunResult {
   address: string;
   entries: number;
   rpcCalls: number;
+  fullRpcCalls: number;
+  signatureRpcCalls: number;
   elapsedMs: number;
   orderingOk: boolean;
   duplicateCount: number;
@@ -46,6 +49,8 @@ async function benchOne(
       address: "(skipped)",
       entries: 0,
       rpcCalls: 0,
+      fullRpcCalls: 0,
+      signatureRpcCalls: 0,
       elapsedMs: 0,
       orderingOk: true,
       duplicateCount: 0,
@@ -59,6 +64,7 @@ async function benchOne(
     const history = await getSOLBalanceOverTime(address, options);
     const elapsed = performance.now() - start;
     const calls = getRpcCallCount();
+    const breakdown = getRpcBreakdown();
 
     let ordered = true;
     const sigs = new Set<string>();
@@ -83,6 +89,8 @@ async function benchOne(
       address: address.slice(0, 8) + "...",
       entries: history.length,
       rpcCalls: calls,
+      fullRpcCalls: breakdown.fullCalls,
+      signatureRpcCalls: breakdown.signatureCalls,
       elapsedMs: Math.round(elapsed),
       orderingOk: ordered,
       duplicateCount: dupes,
@@ -96,6 +104,8 @@ async function benchOne(
       address: address.slice(0, 8) + "...",
       entries: 0,
       rpcCalls: getRpcCallCount(),
+      fullRpcCalls: getRpcBreakdown().fullCalls,
+      signatureRpcCalls: getRpcBreakdown().signatureCalls,
       elapsedMs: Math.round(elapsed),
       orderingOk: true,
       duplicateCount: 0,
@@ -113,17 +123,25 @@ async function main() {
 
   console.error("=== LamportStream Benchmark ===\n");
 
+  const configCases: Array<{ config: string; options: LamportStreamOptions }> = [
+    { config: "default(adaptive)", options: {} },
+  ];
   const rootConcurrencyValues = [40, 48, 56];
   const maxInflightValues = [56, 64, 72];
-  const allResults: RunResult[] = [];
-
   for (const rootConcurrencyOverride of rootConcurrencyValues) {
     for (const maxInflightOverride of maxInflightValues) {
-      const options: LamportStreamOptions = {
-        rootConcurrencyOverride,
-        maxInflightOverride,
-      };
-      const config = `root=${rootConcurrencyOverride}, inflight=${maxInflightOverride}`;
+      configCases.push({
+        config: `root=${rootConcurrencyOverride}, inflight=${maxInflightOverride}`,
+        options: {
+          rootConcurrencyOverride,
+          maxInflightOverride,
+        },
+      });
+    }
+  }
+  const allResults: RunResult[] = [];
+
+  for (const { config, options } of configCases) {
       console.error(`Config: ${config}`);
       const configResults: RunResult[] = [];
 
@@ -131,19 +149,22 @@ async function main() {
         console.error(`  Running: ${wallet.label} (${wallet.address.slice(0, 12)}...)`);
         const result = await benchOne(config, wallet.label, wallet.address, options);
         configResults.push(result);
-        console.error(`    -> ${result.entries} entries | ${result.elapsedMs}ms | ${result.rpcCalls} RPC calls${result.error ? " | " + result.error : ""}`);
+        console.error(`    -> ${result.entries} entries | ${result.elapsedMs}ms | ${result.rpcCalls} RPC calls (${result.fullRpcCalls} full, ${result.signatureRpcCalls} sig)${result.error ? " | " + result.error : ""}`);
       }
 
       const totalMs = configResults.reduce((s, r) => s + r.elapsedMs, 0);
       const totalCalls = configResults.reduce((s, r) => s + r.rpcCalls, 0);
+      const totalFullCalls = configResults.reduce((s, r) => s + r.fullRpcCalls, 0);
+      const totalSignatureCalls = configResults.reduce((s, r) => s + r.signatureRpcCalls, 0);
       const successfulRuns = configResults.filter((r) => !r.error).length;
       const avgMs = successfulRuns > 0 ? Math.round(totalMs / successfulRuns) : null;
       const orderingFailures = configResults.filter((r) => !r.orderingOk).length;
       const duplicateTotal = configResults.reduce((s, r) => s + r.duplicateCount, 0);
+      const worstResult = configResults.reduce((worst, result) =>
+        result.elapsedMs > worst.elapsedMs ? result : worst, configResults[0]);
 
-      console.error(`  Summary -> avg ${avgMs === null ? "n/a" : `${avgMs}ms`} | total ${totalMs}ms | ${totalCalls} RPC calls | order ${orderingFailures === 0 ? "ok" : orderingFailures} | dupes ${duplicateTotal}\n`);
+      console.error(`  Summary -> avg ${avgMs === null ? "n/a" : `${avgMs}ms`} | total ${totalMs}ms | worst ${worstResult.label} ${worstResult.elapsedMs}ms | ${totalCalls} RPC calls (${totalFullCalls} full, ${totalSignatureCalls} sig) | order ${orderingFailures === 0 ? "ok" : orderingFailures} | dupes ${duplicateTotal}\n`);
       allResults.push(...configResults);
-    }
   }
 
   const grouped = new Map<string, RunResult[]>();
