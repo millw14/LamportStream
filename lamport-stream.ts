@@ -277,7 +277,7 @@ function plan(s: Awaited<ReturnType<typeof discover>>, options?: LamportStreamOp
     lo = 16;
     hi = 32;
   } else {
-    conc = 48;
+    conc = 40;
     lo = 48;
     hi = 64;
   }

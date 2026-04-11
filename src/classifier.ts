@@ -38,5 +38,5 @@ export function classify(scout: ScoutResult): ClassificationResult {
     return { density: WalletDensity.Medium, minChunks: 16, maxChunks: 32, concurrency: 24 };
   }
 
-  return { density: WalletDensity.Dense, minChunks: 48, maxChunks: 64, concurrency: 48 };
+  return { density: WalletDensity.Dense, minChunks: 48, maxChunks: 64, concurrency: 40 };
 }
