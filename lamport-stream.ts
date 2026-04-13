@@ -4,18 +4,14 @@
  * Ultra-low latency SOL balance history computation using Helius RPC.
  *
  * Key optimizations:
- *   - 2-call parallel discovery (no binary search)
- *   - Density-aware adaptive chunking + concurrency (8 / 24 / 48)
- *   - Proactive pre-splitting of predicted-hot chunks from scout density
- *   - Recursive hot-chunk subdivision (threshold=65, before pagination triggers)
- *   - MIN_SLOT_SPAN guard prevents wasteful micro-splits
- *   - Dual-layer concurrency control (root limiter + global MAX_INFLIGHT cap)
- *   - Undici connection pool (64 persistent keep-alive sockets, reused TLS)
- *   - Stable ordering by (slot, transactionIndex)
+ *   - Compressed RPC responses (gzip, br, deflate via node:zlib)
+ *   - Bidirectional full-transaction discovery with overlap short-circuit
+ *   - Density-aware adaptive chunking (8 / 24 / 64 concurrency tiers, up to MAX_C=128 chunks)
+ *   - Binary-split recursive subdivision (MAX_SPLIT_DEPTH=8) with linear pagination fallback
+ *   - Single pLimit concurrency control (MAX_INFLIGHT=64, undici pool connections=128)
+ *   - Stable (slot, transactionIndex) ordering with signature dedup
  *   - Explicit finalized / all-history semantics (includes failed txs by default)
  *   - v0 versioned tx support (loadedAddresses → postBalances index mapping)
- *   - Sparse fast-path: ≤100 txns → single call, zero chunking overhead
- *   - Conditional middle scout for dense / periodic candidates
  *   - K-way merge to reduce dense-wallet CPU overhead
  *
  * Optimized for lowest average latency across sparse, periodic, and dense wallets.

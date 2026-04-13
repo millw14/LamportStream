@@ -49,15 +49,14 @@ LamportStream is optimized around the real bottleneck for this problem: minimizi
 
 Key techniques:
 
-- 2-call parallel discovery: newest slot + ascending oldest scout
-- Conditional middle scout only for dense / periodic candidates
-- Density-aware adaptive chunking
-- Adaptive root concurrency: `8 / 24 / 48`
-- Proactive hot-range pre-splitting from scout density
-- Recursive hot-chunk subdivision before pagination becomes expensive
-- Global inflight cap with connection pooling
+- Compressed RPC responses (gzip, br, deflate via `node:zlib`)
+- Bidirectional full-transaction discovery with overlap short-circuit
+- Density-aware adaptive chunking (8 / 24 / 64 concurrency tiers, up to 128 chunks)
+- Binary-split recursive subdivision (`MAX_SPLIT_DEPTH=8`) with linear pagination fallback
+- Single `pLimit` concurrency control (`MAX_INFLIGHT=64`, undici pool `connections=128`)
+- Stable `(slot, transactionIndex)` ordering with signature dedup
+- v0 versioned tx support (`loadedAddresses` → `postBalances` index mapping)
 - K-way merge over completed chunk outputs to reduce copy and GC overhead
-- Sparse wallet fast-path for tiny histories
 
 ## Project layout
 
@@ -133,6 +132,21 @@ The benchmark reports:
 - duplicate signature detection
 - stable ordering checks using `(slot, transactionIndex)`
 - the best configuration across the provided wallet set
+
+## Final submission config
+
+Best config from benchmark sweeps:
+
+- `rootConcurrencyOverride=56`, `maxInflightOverride=72`
+- Benchmark median: ~2400ms avg across the three-wallet set
+
+Reproducibility wallets:
+
+| Label | Address |
+|-------|---------|
+| Sparse | `DpNXPNWvWoHaZ9P3WtfGCb2ZdLihW8VW1w1Ph4KDH9iG` |
+| Periodic | `7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV` |
+| Dense | `vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg` |
 
 ## Scripts
 
