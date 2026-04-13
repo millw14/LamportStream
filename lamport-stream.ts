@@ -28,24 +28,17 @@
 import { Pool } from "undici";
 import pLimit from "p-limit";
 import { pathToFileURL } from "node:url";
+import { gunzipSync, brotliDecompressSync, inflateSync } from "node:zlib";
 
 const RPC_ORIGIN = "https://mainnet.helius-rpc.com";
-const HOT = 65;
 const TARGET_TX = 50;
 const MIN_C = 8;
-const MAX_C = 64;
+const MAX_C = 128;
 const MAX_INFLIGHT = 64;
-const MIN_SPAN = 4;
 const TIMEOUT = 5000;
 const MAX_RETRY = 2;
 const MAX_PAGES_PER_CHUNK = 32;
-const MAX_SIGNATURE_PAGES_PER_CHUNK = 4;
-const TARGET_SIGNATURES_PER_BAND = 80;
-const MAX_HOT_BANDS = 12;
-const MAX_SIGNATURE_PAGES_PER_ULTRA_DENSE_CHUNK = 12;
-const MAX_ULTRA_DENSE_HOT_BANDS = 24;
-const ULTRA_DENSE_SIGNATURE_THRESHOLD = 0.05;
-const SCOUT_LIM = 1000;
+const MAX_SPLIT_DEPTH = 8;
 const FULL_LIM = 100;
 
 interface Entry {
@@ -80,27 +73,6 @@ interface RpcResult<T> {
   paginationToken: string | null;
 }
 
-interface SignatureTx {
-  slot: number;
-  transactionIndex: number;
-  signature: string;
-  blockTime: number | null;
-  err: unknown;
-}
-
-interface SignatureSampleSummary {
-  entries: SignatureTx[];
-  hasMore: boolean;
-  pagesFetched: number;
-}
-
-interface HotBand {
-  gte: number;
-  lt: number;
-  observedSignatures: number;
-  exact: boolean;
-}
-
 export interface RpcBreakdown {
   totalCalls: number;
   fullCalls: number;
@@ -109,7 +81,7 @@ export interface RpcBreakdown {
 
 const url = new URL(RPC_ORIGIN);
 const pool = new Pool(url.origin, {
-  connections: 64,
+  connections: 128,
   pipelining: 1,
   keepAliveTimeout: 30_000,
   keepAliveMaxTimeout: 60_000,
@@ -118,7 +90,6 @@ const pool = new Pool(url.origin, {
 let rpcId = 0;
 let calls = 0;
 let fullCalls = 0;
-let signatureCalls = 0;
 
 export interface LamportStreamOptions {
   apiKey?: string;
@@ -132,13 +103,12 @@ export function getRpcCallCount(): number {
 }
 
 export function getRpcBreakdown(): RpcBreakdown {
-  return { totalCalls: calls, fullCalls, signatureCalls };
+  return { totalCalls: calls, fullCalls, signatureCalls: 0 };
 }
 
 export function resetRpcCallCount(): void {
   calls = 0;
   fullCalls = 0;
-  signatureCalls = 0;
 }
 
 function retryable(e: unknown): boolean {
@@ -181,18 +151,32 @@ async function rpc<T>(
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       calls++;
-      if (cfg.transactionDetails === "signatures") signatureCalls++;
-      else fullCalls++;
-      const { statusCode, body: responseBody } = await pool.request({
+      fullCalls++;
+      const { statusCode, headers: resHeaders, body: responseBody } = await pool.request({
         path: buildRpcPath(apiKey),
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          "accept-encoding": "gzip, deflate, br",
+        },
         body,
         bodyTimeout: timeoutMs,
         headersTimeout: timeoutMs,
       });
 
-      const text = await responseBody.text();
+      const raw = Buffer.from(await responseBody.arrayBuffer());
+      const encoding = (resHeaders["content-encoding"] as string | undefined ?? "").toLowerCase();
+      let buf: Buffer;
+      if (encoding === "gzip" || encoding === "x-gzip") {
+        buf = gunzipSync(raw);
+      } else if (encoding === "br") {
+        buf = brotliDecompressSync(raw);
+      } else if (encoding === "deflate") {
+        buf = inflateSync(raw);
+      } else {
+        buf = raw;
+      }
+      const text = buf.toString("utf8");
       if (statusCode !== 200) throw new Error(`HTTP ${statusCode}: ${text.slice(0, 200)}`);
 
       const json = JSON.parse(text);
@@ -207,99 +191,122 @@ async function rpc<T>(
   throw new Error("unreachable");
 }
 
+interface DiscoverResult {
+  entries: Entry[];
+  complete: boolean;
+  gapStart: number;
+  gapEnd: number;
+  min: number;
+  max: number;
+  cnt: number;
+  range: number;
+  more: boolean;
+  midCnt: number;
+  midRange: number;
+  midMin: number;
+  midMax: number;
+}
+
 async function discover(
   apiKey: string,
   addr: string,
   statusFilter: "succeeded" | "failed" | "any",
-) {
-  const [newest, scout] = await Promise.all([
-    rpc<any>(apiKey, addr, {
-      transactionDetails: "signatures",
-      sortOrder: "desc",
-      limit: 1,
-      commitment: "finalized",
-      maxSupportedTransactionVersion: 0,
-      filters: { status: statusFilter },
-    }),
-    rpc<any>(apiKey, addr, {
-      transactionDetails: "signatures",
-      sortOrder: "asc",
-      limit: SCOUT_LIM,
-      commitment: "finalized",
-      maxSupportedTransactionVersion: 0,
-      filters: { status: statusFilter },
-    }),
+): Promise<DiscoverResult> {
+  const fullCfg = buildFullCfg(statusFilter);
+
+  const [ascResult, descResult] = await Promise.all([
+    rpc<any>(apiKey, addr, { ...fullCfg, sortOrder: "asc" }),
+    rpc<any>(apiKey, addr, { ...fullCfg, sortOrder: "desc" }),
   ]);
 
-  if (!newest.data.length || !scout.data.length) {
+  const ascData = ascResult.data ?? [];
+  const descData = descResult.data ?? [];
+
+  if (!ascData.length && !descData.length) {
     return {
-      min: 0,
-      max: 0,
-      cnt: 0,
-      range: 0,
-      more: false,
-      midCnt: 0,
-      midRange: 0,
-      midMin: 0,
-      midMax: 0,
+      entries: [], complete: true,
+      gapStart: 0, gapEnd: 0, min: 0, max: 0,
+      cnt: 0, range: 0, more: false,
+      midCnt: 0, midRange: 0, midMin: 0, midMax: 0,
     };
   }
 
-  const cnt = scout.data.length;
-  let midCnt = 0;
-  let midRange = 0;
-  let midMin = 0;
-  let midMax = 0;
-
-  const min = scout.data[0].slot;
-  const max = newest.data[0].slot;
-  const range = scout.data[cnt - 1].slot - scout.data[0].slot + 1;
-  const more = scout.paginationToken !== null;
-
-  if (more || cnt >= 200) {
-    const midpoint = min + Math.floor((max - min) / 2);
-    const halfWindow = Math.max(1, Math.floor(range / 2));
-    const midStart = Math.max(min, midpoint - halfWindow);
-    const midEnd = Math.min(max + 1, midpoint + halfWindow);
-    const mid = await rpc<any>(apiKey, addr, {
-      transactionDetails: "signatures",
-      sortOrder: "asc",
-      limit: SCOUT_LIM,
-      commitment: "finalized",
-      maxSupportedTransactionVersion: 0,
-      filters: {
-        status: statusFilter,
-        slot: { gte: midStart, lt: midEnd },
-      },
-    });
-    if (mid.data.length > 0) {
-      midCnt = mid.data.length;
-      midMin = mid.data[0].slot;
-      midMax = mid.data[mid.data.length - 1].slot;
-      midRange = mid.data[mid.data.length - 1].slot - mid.data[0].slot + 1;
-    }
+  const seen = new Set<string>();
+  const allTx: any[] = [];
+  for (const tx of ascData) {
+    const sig = tx.transaction?.signatures?.[0];
+    if (sig && !seen.has(sig)) { seen.add(sig); allTx.push(tx); }
+  }
+  for (const tx of descData) {
+    const sig = tx.transaction?.signatures?.[0];
+    if (sig && !seen.has(sig)) { seen.add(sig); allTx.push(tx); }
   }
 
+  const entries = toEntries(allTx, addr);
+  entries.sort(compareEntries);
+
+  if (ascData.length < FULL_LIM || descData.length < FULL_LIM) {
+    return {
+      entries, complete: true,
+      gapStart: 0, gapEnd: 0, min: 0, max: 0,
+      cnt: ascData.length, range: 0, more: false,
+      midCnt: 0, midRange: 0, midMin: 0, midMax: 0,
+    };
+  }
+
+  const ascLastSlot = ascData[ascData.length - 1].slot;
+  const descLastSlot = descData[descData.length - 1].slot;
+
+  if (ascLastSlot >= descLastSlot) {
+    return {
+      entries, complete: true,
+      gapStart: 0, gapEnd: 0, min: 0, max: 0,
+      cnt: ascData.length, range: 0, more: false,
+      midCnt: 0, midRange: 0, midMin: 0, midMax: 0,
+    };
+  }
+
+  const min = ascData[0].slot;
+  const max = descData[0].slot;
+  const ascRange = ascLastSlot - min + 1;
+  const gapStart = ascLastSlot;
+  const gapEnd = descLastSlot + 1;
+
   return {
+    entries,
+    complete: false,
+    gapStart,
+    gapEnd,
     min,
     max,
-    cnt,
-    range,
-    more,
-    midCnt,
-    midRange,
-    midMin,
-    midMax,
+    cnt: ascData.length,
+    range: ascRange,
+    more: true,
+    midCnt: 0,
+    midRange: 0,
+    midMin: 0,
+    midMax: 0,
   };
 }
 
-function plan(s: Awaited<ReturnType<typeof discover>>, options?: LamportStreamOptions) {
+interface PlanInput {
+  min: number;
+  max: number;
+  cnt: number;
+  range: number;
+  more: boolean;
+  midCnt: number;
+  midRange: number;
+  midMin: number;
+  midMax: number;
+}
+
+function plan(s: PlanInput, options?: LamportStreamOptions) {
   const total = s.max - s.min;
   const totalSlotRange = Math.max(1, total + 1);
   const oldestDensity = s.range > 0 ? s.cnt / s.range : 0.000001;
   const midDensity = s.midCnt && s.midRange ? s.midCnt / s.midRange : 0;
   const density = Math.max(oldestDensity, midDensity || 0);
-  const ultraDense = density >= ULTRA_DENSE_SIGNATURE_THRESHOLD;
   const sampledTx = s.cnt + s.midCnt;
   const sampledRange = s.range + s.midRange;
   const blendedDensity = sampledRange > 0 ? sampledTx / sampledRange : density;
@@ -321,12 +328,12 @@ function plan(s: Awaited<ReturnType<typeof discover>>, options?: LamportStreamOp
     lo = 16;
     hi = 32;
   } else {
-    conc = 40;
-    lo = 48;
-    hi = 64;
+    conc = 64;
+    lo = 64;
+    hi = 128;
   }
 
-  if (total <= 0) return { chunks: [{ gte: s.min, lt: s.max + 1 }] as Chunk[], conc, ultraDense };
+  if (total <= 0) return { chunks: [{ gte: s.min, lt: s.max + 1 }] as Chunk[], conc };
 
   let chunkCount = Math.ceil(total / Math.max(1, Math.floor(TARGET_TX / Math.max(density, 1e-6))));
   chunkCount = Math.max(lo, Math.min(hi, chunkCount));
@@ -369,7 +376,7 @@ function plan(s: Awaited<ReturnType<typeof discover>>, options?: LamportStreamOp
     appendRangeChunks(scoutEnd, midStart, beforeMidBudget, outerDensity);
     appendRangeChunks(midStart, midEnd, midBudget, midDensity);
     appendRangeChunks(midEnd, s.max + 1, afterMidBudget, outerDensity);
-    return { chunks, conc: options?.rootConcurrencyOverride ?? conc, ultraDense };
+    return { chunks, conc: options?.rootConcurrencyOverride ?? conc };
   }
 
   const step = Math.ceil(total / chunkCount);
@@ -395,7 +402,7 @@ function plan(s: Awaited<ReturnType<typeof discover>>, options?: LamportStreamOp
     }
   }
 
-  return { chunks, conc: options?.rootConcurrencyOverride ?? conc, ultraDense };
+  return { chunks, conc: options?.rootConcurrencyOverride ?? conc };
 }
 
 function addressIndex(tx: any, addr: string): number {
@@ -553,166 +560,6 @@ function buildFullCfg(statusFilter: "succeeded" | "failed" | "any"): RpcCfg {
   };
 }
 
-function buildSignaturesCfg(statusFilter: "succeeded" | "failed" | "any"): RpcCfg {
-  return {
-    transactionDetails: "signatures",
-    sortOrder: "asc",
-    limit: SCOUT_LIM,
-    commitment: "finalized",
-    maxSupportedTransactionVersion: 0,
-    filters: { status: statusFilter },
-  };
-}
-
-async function sampleChunkSignatures(
-  apiKey: string,
-  addr: string,
-  chunk: Chunk,
-  statusFilter: "succeeded" | "failed" | "any",
-  timeoutMs: number,
-  maxPages: number,
-): Promise<SignatureSampleSummary> {
-  const cfg = buildSignaturesCfg(statusFilter);
-  const entries: SignatureTx[] = [];
-  const seenTokens = new Set<string>();
-  let token: string | null = null;
-  let pagesFetched = 0;
-
-  do {
-    const page: RpcResult<SignatureTx> = await rpc<SignatureTx>(
-      apiKey,
-      addr,
-      {
-        ...cfg,
-        paginationToken: token ?? undefined,
-        filters: { ...cfg.filters, slot: { gte: chunk.gte, lt: chunk.lt } },
-      },
-      1,
-      timeoutMs,
-    );
-
-    pagesFetched++;
-    if (page?.data?.length) {
-      for (let i = 0; i < page.data.length; i++) entries.push(page.data[i]);
-    } else {
-      return { entries, hasMore: false, pagesFetched };
-    }
-
-    token = page.paginationToken;
-    if (!token || seenTokens.has(token) || pagesFetched >= maxPages) {
-      return { entries, hasMore: Boolean(token), pagesFetched };
-    }
-    seenTokens.add(token);
-  } while (token);
-
-  return { entries, hasMore: false, pagesFetched };
-}
-
-function buildHotBands(chunk: Chunk, sample: SignatureSampleSummary, maxBands: number): HotBand[] {
-  if (sample.entries.length === 0) return [];
-
-  const groupSize = Math.max(
-    TARGET_SIGNATURES_PER_BAND,
-    Math.ceil(sample.entries.length / maxBands),
-  );
-
-  const bands: HotBand[] = [];
-  let idx = 0;
-  while (idx < sample.entries.length) {
-    const startSlot = sample.entries[idx].slot;
-    let endIdx = Math.min(idx + groupSize - 1, sample.entries.length - 1);
-    while (
-      endIdx + 1 < sample.entries.length &&
-      sample.entries[endIdx + 1].slot === sample.entries[endIdx].slot
-    ) {
-      endIdx++;
-    }
-
-    const endSlot = sample.entries[endIdx].slot + 1;
-    if (endSlot > startSlot) {
-      bands.push({
-        gte: startSlot,
-        lt: endSlot,
-        observedSignatures: endIdx - idx + 1,
-        exact: !sample.hasMore || endIdx < sample.entries.length - 1,
-      });
-    }
-    idx = endIdx + 1;
-  }
-
-  if (sample.hasMore) {
-    const tailStart = sample.entries[sample.entries.length - 1].slot + 1;
-    if (tailStart < chunk.lt) {
-      bands.push({
-        gte: tailStart,
-        lt: chunk.lt,
-        observedSignatures: 0,
-        exact: false,
-      });
-    }
-  }
-
-  const normalized: HotBand[] = [];
-  for (let i = 0; i < bands.length; i++) {
-    const band = bands[i];
-    const gte = Math.max(chunk.gte, band.gte);
-    const lt = Math.min(chunk.lt, band.lt);
-    if (lt <= gte) continue;
-
-    const prev = normalized[normalized.length - 1];
-    if (prev && gte <= prev.lt) {
-      prev.lt = Math.max(prev.lt, lt);
-      prev.observedSignatures += band.observedSignatures;
-      prev.exact = prev.exact && band.exact;
-    } else {
-      normalized.push({ ...band, gte, lt });
-    }
-  }
-
-  return normalized;
-}
-
-async function refineChunkWithSignatures(
-  apiKey: string,
-  addr: string,
-  chunk: Chunk,
-  depth: number,
-  timeoutMs: number,
-  statusFilter: "succeeded" | "failed" | "any",
-  globalLimiter: ReturnType<typeof pLimit>,
-  useSignatureHotBands: boolean,
-): Promise<Entry[] | null> {
-  const sample = await sampleChunkSignatures(
-    apiKey,
-    addr,
-    chunk,
-    statusFilter,
-    timeoutMs,
-    useSignatureHotBands ? MAX_SIGNATURE_PAGES_PER_ULTRA_DENSE_CHUNK : MAX_SIGNATURE_PAGES_PER_CHUNK,
-  );
-  const hotBands = buildHotBands(
-    chunk,
-    sample,
-    useSignatureHotBands ? MAX_ULTRA_DENSE_HOT_BANDS : MAX_HOT_BANDS,
-  );
-  if (hotBands.length <= 1) return null;
-
-  const childChunks = hotBands.map((band) => ({ gte: band.gte, lt: band.lt }));
-  if (
-    childChunks.length === 1 &&
-    childChunks[0].gte === chunk.gte &&
-    childChunks[0].lt === chunk.lt
-  ) {
-    return null;
-  }
-
-  const completed = await Promise.all(
-    childChunks.map((child) =>
-      globalLimiter(() => fetchRetry(apiKey, addr, child, depth + 1, statusFilter, globalLimiter, useSignatureHotBands))),
-  );
-  return mergeManySorted(completed);
-}
-
 async function fetchChunk(
   apiKey: string,
   addr: string,
@@ -721,25 +568,8 @@ async function fetchChunk(
   timeoutMs: number,
   statusFilter: "succeeded" | "failed" | "any",
   globalLimiter: ReturnType<typeof pLimit>,
-  useSignatureHotBands: boolean,
 ): Promise<Entry[]> {
   const span = chunk.lt - chunk.gte;
-  const shouldRefineBeforeFull = useSignatureHotBands && depth < 6 && span > MIN_SPAN;
-
-  if (shouldRefineBeforeFull) {
-    const refined = await refineChunkWithSignatures(
-      apiKey,
-      addr,
-      chunk,
-      depth,
-      timeoutMs,
-      statusFilter,
-      globalLimiter,
-      useSignatureHotBands,
-    );
-    if (refined) return refined;
-  }
-
   const fullCfg = buildFullCfg(statusFilter);
   const result = await rpc<any>(
     apiKey,
@@ -751,37 +581,19 @@ async function fetchChunk(
 
   if (!result?.data) return [];
 
-  const hot = result.data.length >= HOT;
-  const paginated = result.paginationToken !== null;
-  const shouldSplit = span > MIN_SPAN && depth < 10 && (hot || result.data.length >= FULL_LIM);
-  const shouldPaginate = paginated && result.data.length >= FULL_LIM;
-  const shouldUseSignatureBands = useSignatureHotBands && result.data.length >= FULL_LIM;
+  const pageFull = result.data.length >= FULL_LIM;
 
-  if (shouldSplit) {
-    if (shouldUseSignatureBands) {
-      const refined = await refineChunkWithSignatures(
-        apiKey,
-        addr,
-        chunk,
-        depth,
-        timeoutMs,
-        statusFilter,
-        globalLimiter,
-        useSignatureHotBands,
-      );
-      if (refined) return refined;
-    }
-
+  if (pageFull && span > 1 && depth < MAX_SPLIT_DEPTH) {
     const mid = chunk.gte + (span >> 1);
     const [left, right] = await Promise.all([
-      globalLimiter(() => fetchRetry(apiKey, addr, { gte: chunk.gte, lt: mid }, depth + 1, statusFilter, globalLimiter, useSignatureHotBands)),
-      globalLimiter(() => fetchRetry(apiKey, addr, { gte: mid, lt: chunk.lt }, depth + 1, statusFilter, globalLimiter, useSignatureHotBands)),
+      globalLimiter(() => fetchRetry(apiKey, addr, { gte: chunk.gte, lt: mid }, depth + 1, statusFilter, globalLimiter)),
+      globalLimiter(() => fetchRetry(apiKey, addr, { gte: mid, lt: chunk.lt }, depth + 1, statusFilter, globalLimiter)),
     ]);
     return mergeSorted(left, right);
   }
 
   let txns = result.data;
-  if (shouldPaginate) {
+  if (pageFull && result.paginationToken) {
     let token: string | null = result.paginationToken;
     const seenTokens = new Set<string>();
     let pagesFetched = 0;
@@ -813,12 +625,11 @@ async function fetchRetry(
   depth: number,
   statusFilter: "succeeded" | "failed" | "any",
   globalLimiter: ReturnType<typeof pLimit>,
-  useSignatureHotBands: boolean,
 ): Promise<Entry[]> {
   try {
-    return await fetchChunk(apiKey, addr, chunk, depth, TIMEOUT, statusFilter, globalLimiter, useSignatureHotBands);
+    return await fetchChunk(apiKey, addr, chunk, depth, TIMEOUT, statusFilter, globalLimiter);
   } catch {
-    return fetchChunk(apiKey, addr, chunk, depth, TIMEOUT * 2, statusFilter, globalLimiter, useSignatureHotBands);
+    return fetchChunk(apiKey, addr, chunk, depth, TIMEOUT * 2, statusFilter, globalLimiter);
   }
 }
 
@@ -828,21 +639,16 @@ export async function getSOLBalanceOverTime(
 ): Promise<Entry[]> {
   const apiKey = resolveApiKey(options);
   const statusFilter = resolveStatusFilter(options);
-  const scout = await discover(apiKey, address, statusFilter);
-  if (scout.cnt === 0) return [];
+  const disc = await discover(apiKey, address, statusFilter);
 
-  if (!scout.more && scout.cnt <= FULL_LIM) {
-    const fullCfg = buildFullCfg(statusFilter);
-    const result = await rpc<any>(apiKey, address, {
-      ...fullCfg,
-    });
-    return toEntries(result.data, address);
-  }
+  if (disc.entries.length === 0) return [];
+  if (disc.complete) return disc.entries;
 
-  const { chunks, conc, ultraDense } = plan(scout, options);
-  const globalLimiter = pLimit(options?.maxInflightOverride ?? MAX_INFLIGHT);
-  const rootLimiter = pLimit(conc);
+  const { chunks } = plan(disc, options);
+  const limiter = pLimit(options?.maxInflightOverride ?? MAX_INFLIGHT);
   const completed: Entry[][] = [];
+
+  if (disc.entries.length > 0) completed.push(disc.entries);
 
   await new Promise<void>((resolve, reject) => {
     let finished = 0;
@@ -853,8 +659,8 @@ export async function getSOLBalanceOverTime(
     }
 
     for (const chunk of chunks) {
-      rootLimiter(() => globalLimiter(() =>
-        fetchRetry(apiKey, address, chunk, 0, statusFilter, globalLimiter, ultraDense)))
+      limiter(() =>
+        fetchRetry(apiKey, address, chunk, 0, statusFilter, limiter))
         .then((entries) => {
           if (entries.length > 0) completed.push(entries);
           if (++finished === total) resolve();
